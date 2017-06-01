@@ -1,0 +1,361 @@
+#######################################################################
+# IPM - Integrated Population Model for BBS & MAPS data               #
+# This model incorporates:                                            #                                   
+# 1. the population model of Link & Saure (2002)                      #
+# 2. CJS model of Saracco et al. (2011)                               #
+# Last edited 07 Aug 2015                                             #
+# by                                                                  #  
+# Farshid Ahrestani, James Saracco,                                   #
+# John Sauer & Andy Royble                                            #
+#######################################################################
+rm(list=ls())
+
+setwd("0.Data/0.IBP/0.MAPSanalyses/")
+#load libraries 
+library(foreign)
+library(jagsUI)
+library(reshape)
+library(ggplot2)
+
+#################################################################################
+#################################################################################
+# Lading the BBS data: using raw BBS files
+#################################################################################
+#################################################################################
+meta.data <- read.csv("aou-data.csv")  # "species commmon name", "AOU", "file which has the data"
+routes <- read.csv("routes.csv") # Loading Routes
+routes.bcr.30 <- routes[routes$BCR ==30,]
+# Generating unique route numbers in the "routes" file
+routes.bcr.30$rt.100 <- routes.bcr.30$Route+100
+routes.bcr.30$sp.rt <- as.numeric(paste(routes.bcr.30$countrynum, routes.bcr.30$statenum, routes.bcr.30$rt.100, sep=""))
+# Generating unique route numbers in the "obs.data" file
+obs.data <- read.csv("weather.csv")
+obs.data <- obs.data[,c(1:6,9)]
+obs.data$rt.100 <- obs.data$Route+100
+obs.data$sp.rt <- as.numeric(paste(obs.data$countrynum, obs.data$statenum, obs.data$rt.100, sep=""))
+
+# id# 95 = Gray catbird
+# id# 46 = Wood thrush
+
+for (id in c(95)) {
+  # Reading raw BBS data
+  file.name <- paste("Species CSV/",meta.data[id,3], sep="") 
+  sp.data <- read.csv(file.name)
+  # Deriving species-specific data 
+  speciesID <- as.numeric(meta.data[id,2])
+  species <- sp.data[sp.data$Aou == speciesID,]
+  # Only for years for which there is MAPS data
+  species <- species[species$Year > 1991 & species$Year < 2009,]
+  species <- species[species$SpeciesTotal > 0,]
+  # Necessary to ensure we have unique transect numbers and to avoid situations like: "1.44" == "14.4"
+  species$rt.100 <- species$Route+100
+  species$sp.rt <- as.numeric(paste(species$countrynum, species$statenum, species$rt.100, sep=""))
+}
+#################################################################################
+#Preparing states
+bbs.state.ids <- read.csv("bbs.state.ids.csv")
+bbs.state.ids.us <- bbs.state.ids[bbs.state.ids$country == 840,]
+# The states present in the dataset
+bbs.states <- as.vector(as.numeric(unique(routes.bcr.30[,2])))
+# The names and abbrviations of the states in the dataset
+bbs.st.names <- bbs.state.ids.us[match(bbs.states, bbs.state.ids.us$state), 2:4]
+
+#Adding the areas of the states
+bcr.state.areas <- read.csv("bcr.state-area.csv")
+bcr.30.areas <- bcr.state.areas[bcr.state.areas$bcr==30,]
+bbs.st.names$area <- bcr.30.areas$area[match(bbs.states, bcr.30.areas$state)]
+bbs.st.names <- bbs.st.names[order(bbs.st.names$abr),]
+#If doing all states
+nstates <- as.numeric(nrow(bbs.st.names))
+#################################################################################
+# Populating dataframe with state names and area 
+for (i in 1:nstates){
+  st <- bbs.st.names[i,1]
+  for (j in 1:nrow(routes.bcr.30)){
+    if (routes.bcr.30$state[j] == st){
+      routes.bcr.30$stname[j] <- as.character(bbs.st.names[i,3])
+      routes.bcr.30$area[j] <- as.numeric(bbs.st.names[i,4])
+    }
+  } 
+}
+
+# Ordering the dataset by state
+routes.bcr.30 <- routes.bcr.30[order(routes.bcr.30$stname),]
+#################################################################################
+# Declaring the empty sets for the jags model Data
+year.list <- c(1992:2008)
+counts <- matrix(NA, nrow=nrow(routes.bcr.30), ncol=17) 
+observer <- matrix(NA, nrow=nrow(routes.bcr.30), ncol=17) 
+firstyr <- matrix(NA, nrow=nrow(routes.bcr.30), ncol=17) 
+#####################################
+# Populating the counts and observer matrices
+#####################################
+# the nrow of routes.bcr.30 == no. of transects
+for (i in 1:nrow(routes.bcr.30)){
+  # The duration of the study
+  for (t in 1:17){
+    # This corresponds to "countstate"
+    # Acquiring the right 'route no' & 'year'
+    route.id <- routes.bcr.30[i,13]
+    year.id <- year.list[t]
+    if (any(species$sp.rt == route.id & species$Year == year.id)){
+      the.counts <- species[species$sp.rt == route.id & species$Year == year.id,]
+      # The next two 'if' statements are needed because there are sometimes
+      # more than one row for a transect in a given year
+      if (nrow(the.counts) == 1){
+        counts[i,t] <- the.counts$SpeciesTotal
+      } else if (nrow(the.counts) >1){
+        counts[i,t] <- the.counts$SpeciesTotal[the.counts$RPID == 101]
+      }
+    }
+    the.obs <- obs.data$ObsN[obs.data$sp.rt == route.id & obs.data$Year == year.id]
+    if (length(the.obs) == 1){
+      observer[i,t] <- the.obs
+    }   
+  }
+}
+#####################################
+# Populating counts matrix with 0's
+# i.e., years transects were sampled but no sp. of interest was detected
+for (i in 1:nrow(counts)){
+  for (t in 1:17){
+    if(is.na(counts[i,t])){
+      route.id <- routes.bcr.30[i,13]
+      year.id <- year.list[t]
+      if (any(obs.data$sp.rt == route.id & obs.data$Year == year.id)){
+        counts[i,t] <- 0
+      }
+    }
+  }
+}
+#####################################
+# Populating the firstyr matrix
+for (i in 1:nrow(firstyr)){
+  for (t in 1:17){
+    obs.N <- observer[i,t]
+    #print(obs.N)
+    if (!(is.na(obs.N))){
+      first.BBS <- min(obs.data$Year[obs.data$ObsN == obs.N])
+      if (first.BBS == year.list[t]){
+        firstyr[i,t] <- 1
+      } else{
+        firstyr[i,t] <- 0
+      }
+    }     
+  }
+}
+#################################################################################
+# Getting rid of rows that are either 'all NAs' or 'only NAs and 0s'
+counts.final <- counts[rowSums(counts, na.rm=TRUE) >0,]
+observer.final <- observer[rowSums(counts, na.rm=TRUE) > 0,]
+firstyr.final <- firstyr[rowSums(counts, na.rm=TRUE) > 0,]
+routes.final <- routes.bcr.30[rowSums(counts, na.rm=TRUE) > 0,]
+#################################################################################
+#Recalculate state list included in BBS data
+# The states present in the dataset
+bbs.states.end <- as.vector(unique(routes.final[,14]))
+# The names and abbrviations of the states in the dataset
+bbs.st.names.end <- bbs.st.names[match(bbs.states.end, bbs.st.names$abr), 1:4]
+
+#################################################################################
+################################################################################
+#Read and prep the capture-recapture data
+#################################################################################
+################################################################################
+# GETTING THE BAND DATA READY
+# only adult age classes (age = 1, 5, or 6) included here
+band<-read.dbf("data/CAHI17YR.dbf") 
+# get rid of some stuff
+band <- data.frame(subset(band, select = 1:24), subset(band, select=c(MARKED, LOSS, SURV, MIG2)))
+# read station data and subset strata info
+stadat <- read.dbf("data/STATIONS.dbf")
+stadat <- subset(stadat, select = c(STA, STATE, BCR))
+# The column common to these two datasets is sta (stations)
+band <- merge(band, stadat) 
+#subset species of interest
+band <- subset(band, band$SPEC=="GRCA") # "GRCA" == GRay CAtbird 
+#band <- subset(band, band$SPEC=="WOTH") # "WOTH" == W0od THrush
+band <- subset(band, band$BCR==30)
+#remove dead birds
+band <- subset(band, is.na(band$LOSS)) 
+# select only breeding stations
+band <- band[band$MIG2 %in% c("B", "O", "U"),]
+#remove birds at stations with < 4 yrs (4 yrs needed for transient models)                            
+band <- band[band$SURV %in% c("B", "S"),]
+# If doing all states
+band <- band[order(band$STATE),] 
+################################################################################
+# Getting the list of states from MAPS data
+################################################################################
+maps.states <- unique(band$STATE)
+################################################################################
+# MATCHING MAPS TO BBS
+bbs.maps.states <- as.character(bbs.st.names.end[,3])
+band <- band[band$STATE %in% bbs.maps.states,]
+################################################################################
+# SELECTING ONLY C-M-R DATA
+# Extracting in matrix form 
+y<-as.matrix(band[,8:24])
+#Analyses need NA for missing data (change 'n' to 'NA')
+y[y=="n"]<- NA
+#Replace missed sta/years with zeros 
+y[y=="S"]<-"1" # S is data sufficient for survival analyses, but not productivity and bird was captured
+y[y=="s"]<-"0" # s is data sufficient for survival analyses, but not productivity and bird was NOT captured
+#Replace reduced-effort caps (x) with ones 
+y[y=="X"]<-"1" # bird was captured, but data was not of much use
+#Replace reduced-effort non-caps (X) with zeros
+y[y=="x"]<-"0" # bird was NOT captured     
+# Making sure that "y" is numeric: its rows are capture histories over 17 years
+class(y) <- "numeric"
+################################################################################
+# SELECTING OTHER DATA
+# Extracting STATE data
+states.raw <- band$STATE
+# Extracting station data
+sta=as.numeric(band$STA)
+# Converting sex data to 1s & 0s
+sex <- rep(NA,nrow(y))
+sex[band$SEX == "M"] <- 1
+sex[band$SEX == "F"] <- 0
+# create indicator variable for pre-determined resident i.e., r(i) = 1
+r <-band$MARKED 
+# The reason for the next line is because the previous lines converts MARKED into factors
+r <- as.numeric(r)-1 
+# define no. individuals, no. yrs, and create empty vectors for first and last captures
+nos.yrs<-as.numeric(nrow(y))
+nyear<-17
+last<-first<-rep(NA,nos.yrs)
+#################################################################################
+# Creating the all important first vector
+for(i in 1:nos.yrs){
+  h<-as.vector(y[i,])
+  first[i] <- min( (1:17)[!is.na(h) & h==1])
+  last[i]  <- max( (1:17)[!is.na(h) & h==1])
+}
+#################################################################################
+# Getting the data ready for the model 
+Zst<-y
+Zst[Zst==0]<-1
+Zst[is.na(Zst)]<-1
+#################################################################################
+# Getting rid of some unneeded data (initial capture in last year)
+y<-y[first<17,]
+Zst<-Zst[first<17,]
+r<-r[first<17]
+sex <-sex[first<17]
+sta<-sta[first<17]
+last<-last[first<17]
+states.raw <- states.raw[first<17]
+first<-first[first<17]
+#################################################################################
+# The stations in BCR of interest
+stations <- unique(sta)
+nsta <- as.numeric(length(stations))
+# Converting state data values to reflect 1:nstate
+for (i in 1:nsta){
+  sta[sta == stations[i]] <- i
+}
+#################################################################################
+# The all-important nind
+nind<-as.numeric(nrow(y))
+#################################################################################
+# Ensuring the the BBS data reflects the final set of states of the MAPS data
+#################################################################################
+# Getting rid of states that do not feature in the MAPS data
+counts.final <- counts.final[routes.final$stname %in% as.character(unique(states.raw)),]
+observer.final <- observer.final[routes.final$stname %in% as.character(unique(states.raw)),]
+firstyr.final <- firstyr.final[routes.final$stname %in% as.character(unique(states.raw)),]
+routes.final <- routes.final[routes.final$stname %in% as.character(unique(states.raw)),]
+#################################################################################
+# Making observers 1:max(observers)
+n.observers <- unique(as.vector(observer.final, mode='numeric'))
+good <- complete.cases(n.observers)
+n.observers <- n.observers[good]
+obs=1
+for (uo in n.observers){
+  observer.final[observer.final == uo] <- obs
+  obs=obs+1
+}
+
+#################################################################################
+#################################################################################
+# Preping for and running the model in jags
+#################################################################################
+#################################################################################
+final.states <- as.character(unique(states.raw))
+bbs.st.names.end <- bbs.st.names.end[bbs.st.names.end$abr %in% final.states,]
+nstrata <- as.numeric(nrow(bbs.st.names.end)) 
+areaweight <- as.numeric(bbs.st.names.end$area)
+nonzeroweight <- rep(1,nstrata)
+
+count <- as.vector(counts.final)
+firstyr <- as.vector(firstyr.final)
+obser <- as.vector(observer.final)
+
+# Converting state data values to reflect 1:nstate
+for (i in 1:length(final.states)){
+  st <- bbs.st.names.end[i,3]
+  routes.final$stnumber[routes.final$stname == st] <- i
+}
+#Creating the 'strat' vector
+strat <- as.numeric(vector())
+strat.vector <- as.numeric(routes.final$stnumber)
+strat <- rep(strat.vector, nyear)
+
+year <- as.numeric(vector())
+n.routes <- nrow(counts.final)
+for (i in 1:nyear){
+  yr.data <- rep(i,n.routes)
+  year <- c(year,yr.data)
+}
+
+temp.df <- as.numeric(data.frame())
+temp.df <- cbind(temp.df,count,firstyr, obser,strat,year)
+final.df <- as.data.frame(na.omit(temp.df))
+#final.df <- final.df[final.df$count > 0,]
+
+count <- final.df$count
+firstyr <- final.df$firstyr
+obser <- final.df$obser
+strat <- final.df$strat
+year <- final.df$year
+
+ncounts <- as.numeric(length(count))
+nyears <- nyear
+nobservers <- as.numeric(length(n.observers))
+#################################################################################
+# INITS 
+# Initial values for residency
+Rst<-rep(1,nrow(y))
+inits <- function(){
+  list(R=Rst, z=Zst,
+       phi0=runif(nyears-1,.3,.6), p0=runif(nyears-1,.3,.6), 
+       rho0=runif(nyears-1,.3,.6), pi0=runif(nyears-1,.3,.6), 
+       sigma.p = runif(1,0,5), 
+       eta=1, taunoise=1, tauobs=1, f=runif(nyears-1, 0.3, 1.3), n1=rpois(nstrata,17))
+}  
+#################################################################################
+# BUNDLE DATA FOR THE MODEL
+jags.data <- list(y=y, nind=nind, nyears=nyears, first=first, r=r, sta=sta, nsta=nsta, 
+                  ncounts=ncounts, nobservers=nobservers, nstrata=nstrata, 
+                  strat=strat, firstyr=firstyr, count=count, year=year, obser=obser, 
+                  areaweight=areaweight, nonzeroweight=nonzeroweight)
+
+################################################################################# 
+# Parameters monitored
+parameters <- c("phi0", "p0", "pi0", "rho0", "f", "eta", "sdnoise", "sdobs", "CompIndex", "Bbar")
+#################################################################################
+# MCMC settings
+ni <- 100000
+nt <- 4
+nb <- 50000
+nc <- 3
+#################################################################################
+# Calling JAGS 
+WOTH.ipm <- jags(jags.data, inits, parameters, "../Jim/models/maps-bbs_ipm-final-no.noise+obs.jags", 
+            n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb, parallel=TRUE)
+
+cjs <- jags(jags.data, inits, parameters, "../Jim/models/maps-bbs_cjs-final.jags", 
+            n.chains = nc, n.thin = nt, n.iter = 30000, n.burnin = 20000, parallel=TRUE)
+
+#################################################################################
